@@ -10,6 +10,9 @@
 - 整批改派：把多条"已认"互认整体改派到各自的目标要求。按本批
   原占用同时释放后的状态核对规则/成绩/学分与目标要求占用；任一项
   不合格则整批保持原样，全部合格才更新要求与进度并保留原互认编号。
+- 培养方案修订：一次修改多项要求所需学分与替代规则最低成绩，全部
+  改动共同生效；随后按新标准复查现存已认互认，失去资格的转待复核
+  （停止计分但保留两端占用），原待复核记录即使重新达标也须显式复核。
 """
 
 from __future__ import annotations
@@ -75,6 +78,22 @@ class ReassignItem(BaseModel):
 
 class ReassignBatchIn(BaseModel):
     items: List[ReassignItem] = Field(min_length=1)
+
+
+class RequirementChange(BaseModel):
+    requirement_id: str = Field(min_length=1, max_length=64)
+    required_credits: int = Field(gt=0, description="新的正整数所需学分")
+
+
+class SubstitutionChange(BaseModel):
+    course_id: str = Field(min_length=1, max_length=64)
+    requirement_id: str = Field(min_length=1, max_length=64)
+    min_score: float = Field(ge=0, le=100, description="新的 0~100 最低成绩")
+
+
+class ProgramRevisionIn(BaseModel):
+    requirement_changes: List[RequirementChange] = Field(default_factory=list)
+    substitution_changes: List[SubstitutionChange] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------- helpers
@@ -240,6 +259,118 @@ def list_substitutions():
             "FROM substitutions ORDER BY course_id, requirement_id"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------- 培养方案修订
+
+
+@app.post("/program/revisions")
+def revise_program(batch: ProgramRevisionIn):
+    """培养方案修订：一次修改多项要求所需学分与替代规则最低成绩。
+
+    - 至少提交一项改动；同一要求 / 同一替代规则不得在本批重复出现；
+      引用不存在或数值无效（由 schema 拦截）则整次不生效（409 回滚）。
+    - 全部改动在一个写事务内共同生效，随后按新标准重新检查现存
+      "已认"互认：不再合格的转"待复核"，停止计分但继续占用两端；
+      原本"待复核"的记录即使按新标准重新达标也保持待复核，须显式复核。
+    - 成功返回已修改项目与转待复核的互认编号；之后的申请、改派与复核
+      一律按新标准判断，已认进度按新学分计算。
+    """
+    if not batch.requirement_changes and not batch.substitution_changes:
+        raise HTTPException(422, "nothing to revise: provide at least one change")
+
+    errors: List[str] = []
+    seen_requirements, seen_rules = set(), set()
+    for i, change in enumerate(batch.requirement_changes):
+        if change.requirement_id in seen_requirements:
+            errors.append(
+                f"requirement_changes[{i}]: requirement "
+                f"{change.requirement_id!r} duplicated in batch"
+            )
+        seen_requirements.add(change.requirement_id)
+    for i, change in enumerate(batch.substitution_changes):
+        key = (change.course_id, change.requirement_id)
+        if key in seen_rules:
+            errors.append(
+                f"substitution_changes[{i}]: substitution "
+                f"({change.course_id!r}, {change.requirement_id!r}) "
+                "duplicated in batch"
+            )
+        seen_rules.add(key)
+    if errors:
+        raise HTTPException(409, errors)
+
+    with db.write_tx() as conn:
+        for change in batch.requirement_changes:
+            if conn.execute(
+                "SELECT 1 FROM requirements WHERE id = ?",
+                (change.requirement_id,),
+            ).fetchone() is None:
+                errors.append(
+                    f"requirement {change.requirement_id!r} not found"
+                )
+        for change in batch.substitution_changes:
+            if conn.execute(
+                "SELECT 1 FROM substitutions WHERE course_id = ? AND requirement_id = ?",
+                (change.course_id, change.requirement_id),
+            ).fetchone() is None:
+                errors.append(
+                    f"substitution ({change.course_id!r}, "
+                    f"{change.requirement_id!r}) not found"
+                )
+        if errors:
+            # 抛出异常 -> write_tx 回滚，整次修订不生效
+            raise HTTPException(409, errors)
+
+        # 所有改动共同生效（同一事务内先更新标准，再按新标准复查）
+        for change in batch.requirement_changes:
+            conn.execute(
+                "UPDATE requirements SET required_credits = ? WHERE id = ?",
+                (change.required_credits, change.requirement_id),
+            )
+        for change in batch.substitution_changes:
+            conn.execute(
+                "UPDATE substitutions SET min_score = ? "
+                "WHERE course_id = ? AND requirement_id = ?",
+                (change.min_score, change.course_id, change.requirement_id),
+            )
+
+        # 仅重新检查现存"已认"互认：失去资格的转待复核；
+        # 原待复核记录不动，即使按新标准重新达标也须显式复核。
+        moved: List[int] = []
+        recs = conn.execute(
+            "SELECT id, course_id, requirement_id FROM recognitions "
+            "WHERE status = 'confirmed' ORDER BY id"
+        ).fetchall()
+        for rec in recs:
+            if not _qualifies(conn, rec["course_id"], rec["requirement_id"]):
+                conn.execute(
+                    "UPDATE recognitions SET status = 'pending', "
+                    "updated_at = datetime('now') WHERE id = ?",
+                    (rec["id"],),
+                )
+                moved.append(rec["id"])
+
+    return {
+        "revised": {
+            "requirements": [
+                {
+                    "requirement_id": c.requirement_id,
+                    "required_credits": c.required_credits,
+                }
+                for c in batch.requirement_changes
+            ],
+            "substitutions": [
+                {
+                    "course_id": c.course_id,
+                    "requirement_id": c.requirement_id,
+                    "min_score": c.min_score,
+                }
+                for c in batch.substitution_changes
+            ],
+        },
+        "moved_to_pending": moved,
+    }
 
 
 # ---------------------------------------------------------------- 互认

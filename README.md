@@ -10,8 +10,9 @@
 - **复核**：成绩恢复后须显式复核才能重新计分；复核仍不合格则维持待复核。
 - **撤销**：删除互认记录，释放两端占用，之后可重新申请。
 - **整批改派**：一次把多条**已认**互认改派到各自的目标要求（`POST /recognitions/reassign`）。按本批原占用**同时释放后**的状态核对：互认编号与目标要求在批内均不得重复、来源须是现存已认记录（待复核不可改派）、课程对目标要求的替代规则/当前成绩/当前学分均合格、目标要求未被批外的已认或待复核记录占用（两条记录互换要求不会相互冲突）。任一项不合格则**原互认与进度整批不变**；成功则保留原互认编号、更新要求与进度。
-- **查询**：`/progress` 区分已认（计分）、待复核（不计分但占用）、空缺；一次查询取同一提交快照，不会混出改派前后的结果。
-- **并发**：所有写操作（申请、成绩更正、复核、撤销、改派）在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发操作不会重复使用或暴露中间态；改派之后的操作一律按改派后的关系判断。
+- **培养方案修订**：`POST /program/revisions` 一次提交多项**要求所需学分**与**替代规则最低成绩**改动（两类各为可选数组，至少提交一项）。同一要求/同一替代规则不得在本批重复，引用不存在或数值无效则**整次不生效**（409/422，事务回滚）；所有改动在一个事务内**共同生效**，随后按新标准复查现存互认：失去资格的**已认**转待复核、停止计分但继续占用两端，原本**待复核**的记录即使按新标准重新达标也须显式复核。成功返回已修改项目与转待复核的互认编号；已认进度按新学分计算，之后的申请、改派与复核均按新标准判断。
+- **查询**：`/progress` 区分已认（计分）、待复核（不计分但占用）、空缺；一次查询取同一提交快照，不会混出改派/修订前后的结果。
+- **并发**：所有写操作（申请、成绩更正、复核、撤销、改派、培养方案修订）在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发操作不会重复使用或暴露中间态；改派/修订之后的操作一律按新标准判断。
 
 ## 启动
 
@@ -99,6 +100,44 @@ curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: applicati
 curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: application/json' \
   -d '{"items": [{"recognition_id": 1, "target_requirement_id": "RD1"}]}'
 # -> 409, detail 说明 RD1 已被批外互认 2 占用；原互认与进度保持不变
+
+# 11. 培养方案修订：一次修改多项要求学分与替代规则最低成绩（共同生效）
+#     下列编号独立，可在全新数据库上直接执行；互认编号以批量互认返回的 id 为准
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "E1", "credits": 4, "score": 90}'
+curl -s -X POST localhost:8000/requirements -H 'Content-Type: application/json' \
+  -d '{"id": "RE1", "required_credits": 4}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "E1", "requirement_id": "RE1", "min_score": 60}'
+curl -s -X POST localhost:8000/recognitions -H 'Content-Type: application/json' \
+  -d '{"items": [{"course_id": "E1", "requirement_id": "RE1"}]}'
+# 把 RE1 所需学分提高到 6、E1->RE1 最低成绩提高到 95：E1 学分不足且成绩不达线，
+# 互认 1 原子转待复核、停止计分但继续占用 RE1/E1 两端
+curl -s -X POST localhost:8000/program/revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"requirement_changes": [{"requirement_id": "RE1", "required_credits": 6}],
+       "substitution_changes": [{"course_id": "E1", "requirement_id": "RE1", "min_score": 95}]}'
+# -> {"revised":{"requirements":[{"requirement_id":"RE1","required_credits":6}],
+#     "substitutions":[{"course_id":"E1","requirement_id":"RE1","min_score":95.0}]},
+#     "moved_to_pending":[1]}
+curl -s localhost:8000/progress   # 已认进度按新学分计算：RE1 变为 pending，earned_credits=0
+
+# 12. 修订同样是整批原子：重复改动 / 引用不存在 -> 整次不生效（409，标准全部保持 6/95）
+curl -s -X POST localhost:8000/program/revisions -H 'Content-Type: application/json' \
+  -d '{"requirement_changes": [
+        {"requirement_id": "RE1", "required_credits": 3},
+        {"requirement_id": "RE1", "required_credits": 5}]}'
+# -> 409, detail 说明 RE1 在本批重复；标准保持 6 不变
+curl -s -X POST localhost:8000/program/revisions -H 'Content-Type: application/json' \
+  -d '{"substitution_changes": [{"course_id": "E1", "requirement_id": "NOPE", "min_score": 60}]}'
+# -> 409, detail 说明替代规则不存在；已有标准全部保持不变
+
+# 13. 标准放宽不会自动恢复：把学分要求与最低成绩调回后，已转待复核的互认 1
+#     即使重新达标，也必须显式复核才重新计分（moved_to_pending 为 []）
+curl -s -X POST localhost:8000/program/revisions -H 'Content-Type: application/json' \
+  -d '{"requirement_changes": [{"requirement_id": "RE1", "required_credits": 4}],
+       "substitution_changes": [{"course_id": "E1", "requirement_id": "RE1", "min_score": 60}]}'
+curl -s -X POST localhost:8000/recognitions/1/review   # -> status: confirmed
 ```
 
 ## API 一览
@@ -115,6 +154,7 @@ curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: applicati
 | POST | `/recognitions` | 批量互认（整批确认或整批不写） |
 | GET | `/recognitions?status=confirmed\|pending` | 按状态查询互认 |
 | POST | `/recognitions/reassign` | 整批改派已认互认到新要求（整批成功或整批不变） |
+| POST | `/program/revisions` | 培养方案修订：批量改要求学分/规则最低成绩，按新标准复查已认互认 |
 | POST | `/recognitions/{id}/review` | 复核待复核记录 |
 | DELETE | `/recognitions/{id}` | 撤销并释放占用 |
 | GET | `/progress` | 进度：已认/待复核/空缺与学分统计 |
