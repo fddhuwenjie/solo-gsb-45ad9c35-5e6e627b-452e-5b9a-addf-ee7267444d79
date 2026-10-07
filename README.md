@@ -10,8 +10,9 @@
 - **复核**：成绩恢复后须显式复核才能重新计分；复核仍不合格则维持待复核。
 - **撤销**：删除互认记录，释放两端占用，之后可重新申请。
 - **整批改派**：一次把多条**已认**互认改派到各自的目标要求（`POST /recognitions/reassign`）。按本批原占用**同时释放后**的状态核对：互认编号与目标要求在批内均不得重复、来源须是现存已认记录（待复核不可改派）、课程对目标要求的替代规则/当前成绩/当前学分均合格、目标要求未被批外的已认或待复核记录占用（两条记录互换要求不会相互冲突）。任一项不合格则**原互认与进度整批不变**；成功则保留原互认编号、更新要求与进度。
-- **查询**：`/progress` 区分已认（计分）、待复核（不计分但占用）、空缺；一次查询取同一提交快照，不会混出改派前后的结果。
-- **并发**：所有写操作（申请、成绩更正、复核、撤销、改派）在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发操作不会重复使用或暴露中间态；改派之后的操作一律按改派后的关系判断。
+- **培养方案修订**：`POST /plan-revisions` 一次修改多项**要求所需学分**与**替代规则最低成绩**。至少提交一项改动；同一要求或同一替代规则在本批内不得重复；引用不存在或数值无效（学分非正整数、成绩不在 0~100）则**整次不生效**。所有改动在同一事务内**共同生效**后按新标准重检现存**已认**互认：失去资格的转**待复核**、停止计分但继续占用两端；原本待复核的即使重新达标也**不自动恢复**，须显式复核。成功返回已修改项目与转待复核的互认编号；已认进度随即按新学分计算，后续申请、改派与复核均按新标准判断。
+- **查询**：`/progress` 区分已认（计分）、待复核（不计分但占用）、空缺；一次查询取同一提交快照，不会混出改派前后或修订前后的结果。
+- **并发**：所有写操作（申请、成绩更正、复核、撤销、改派、培养方案修订）在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发操作不会重复使用或暴露中间态；改派/修订之后的操作一律按新关系、新标准判断。
 
 ## 启动
 
@@ -99,6 +100,48 @@ curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: applicati
 curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: application/json' \
   -d '{"items": [{"recognition_id": 1, "target_requirement_id": "RD1"}]}'
 # -> 409, detail 说明 RD1 已被批外互认 2 占用；原互认与进度保持不变
+
+# 11. 培养方案修订：一次修改多项要求所需学分 / 替代规则最低成绩
+#     下列编号独立，可在全新数据库上直接执行
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "P1", "credits": 4, "score": 90}'
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "P2", "credits": 4, "score": 65}'
+curl -s -X POST localhost:8000/requirements -H 'Content-Type: application/json' \
+  -d '{"id": "RP1", "required_credits": 4}'
+curl -s -X POST localhost:8000/requirements -H 'Content-Type: application/json' \
+  -d '{"id": "RP2", "required_credits": 4}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "P1", "requirement_id": "RP1", "min_score": 60}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "P2", "requirement_id": "RP2", "min_score": 60}'
+curl -s -X POST localhost:8000/recognitions -H 'Content-Type: application/json' \
+  -d '{"items": [{"course_id": "P1", "requirement_id": "RP1"}, {"course_id": "P2", "requirement_id": "RP2"}]}'
+
+# RP1 所需学分 4 -> 5（P1 学分 4 不再足额），P2/RP2 最低成绩 60 -> 70（P2 的 65 不再达标）
+curl -s -X POST localhost:8000/plan-revisions -H 'Content-Type: application/json' -d '{
+  "requirement_changes": [{"requirement_id": "RP1", "required_credits": 5}],
+  "substitution_changes": [{"course_id": "P2", "requirement_id": "RP2", "min_score": 70}]
+}'
+# -> {"revised":{"requirements":[{"requirement_id":"RP1","required_credits":5}],
+#     "substitutions":[{"course_id":"P2","requirement_id":"RP2","min_score":70.0}]},
+#     "moved_to_pending":[1,2]}
+curl -s localhost:8000/progress
+# -> 两条要求均为 pending（停止计分但占用保留），total_required_credits=9、earned_credits=0
+
+# 12. 引用不存在的规则 -> 整次不生效，学分修改也一并回滚
+curl -s -X POST localhost:8000/plan-revisions -H 'Content-Type: application/json' -d '{
+  "requirement_changes": [{"requirement_id": "RP1", "required_credits": 3}],
+  "substitution_changes": [{"course_id": "P1", "requirement_id": "NOPE", "min_score": 50}]
+}'
+# -> 409，RP1 学分保持 5；同要求/同规则在一次提交中重复同样 409；空提交或数值越界为 422
+
+# 13. 重新放宽门槛后，原本待复核的记录不自动计分，须显式复核
+curl -s -X POST localhost:8000/plan-revisions -H 'Content-Type: application/json' \
+  -d '{"substitution_changes": [{"course_id": "P2", "requirement_id": "RP2", "min_score": 60}]}'
+curl -s localhost:8000/progress   # 互认 2 仍 pending、earned_credits 仍为 0
+curl -s -X POST localhost:8000/recognitions/2/review
+# -> {"id":2,"qualified":true,"status":"confirmed"}，此后按 RP2 的 4 学分重新计分
 ```
 
 ## API 一览
@@ -117,4 +160,5 @@ curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: applicati
 | POST | `/recognitions/reassign` | 整批改派已认互认到新要求（整批成功或整批不变） |
 | POST | `/recognitions/{id}/review` | 复核待复核记录 |
 | DELETE | `/recognitions/{id}` | 撤销并释放占用 |
+| POST | `/plan-revisions` | 培养方案修订（批量改学分/最低成绩，整次生效或整次不生效，并重检已认互认） |
 | GET | `/progress` | 进度：已认/待复核/空缺与学分统计 |

@@ -10,6 +10,11 @@
 - 整批改派：把多条"已认"互认整体改派到各自的目标要求。按本批
   原占用同时释放后的状态核对规则/成绩/学分与目标要求占用；任一项
   不合格则整批保持原样，全部合格才更新要求与进度并保留原互认编号。
+- 培养方案修订：一次提交多项"要求所需学分"与"替代规则最低成绩"
+  修改。同一要求/规则在本批内不得重复，引用不存在或数值无效则
+  整次不生效。全部改动共同生效后按新标准重检现存"已认"互认：
+  失去资格的转"待复核"，停止计分但保留两端占用；原本"待复核"
+  的即使重新达标也不自动恢复，须显式复核。
 """
 
 from __future__ import annotations
@@ -75,6 +80,22 @@ class ReassignItem(BaseModel):
 
 class ReassignBatchIn(BaseModel):
     items: List[ReassignItem] = Field(min_length=1)
+
+
+class RequirementCreditChange(BaseModel):
+    requirement_id: str = Field(min_length=1, max_length=64)
+    required_credits: int = Field(gt=0, description="新的正整数学分")
+
+
+class SubstitutionScoreChange(BaseModel):
+    course_id: str = Field(min_length=1, max_length=64)
+    requirement_id: str = Field(min_length=1, max_length=64)
+    min_score: float = Field(ge=0, le=100, description="0~100 的新最低成绩")
+
+
+class PlanRevisionIn(BaseModel):
+    requirement_changes: List[RequirementCreditChange] = Field(default_factory=list)
+    substitution_changes: List[SubstitutionScoreChange] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------- helpers
@@ -542,6 +563,114 @@ def revoke_recognition(recognition_id: int):
     return {
         "revoked": recognition_id,
         "released": {"course_id": rec["course_id"], "requirement_id": rec["requirement_id"]},
+    }
+
+
+# ---------------------------------------------------------------- 培养方案修订
+
+
+@app.post("/plan-revisions")
+def revise_plan(body: PlanRevisionIn):
+    """培养方案修订：一次修改多项要求所需学分与替代规则最低成绩。
+
+    - 至少提交一项改动；同一要求 / 同一替代规则在本批内不得重复；
+    - 引用不存在的要求或替代规则 -> 整次不生效（409，返回全部原因）；
+      学分非正整数、最低成绩不在 0~100 等数值无效由 schema 拦截（422）；
+    - 全部改动在同一写事务内共同生效，随后按新标准重检现存"已认"
+      互认：失去资格的原子地转为"待复核"，停止计分但继续占用课程与
+      要求两端；原本"待复核"的即使按新标准重新达标也保持待复核，
+      须显式复核才能重新计分；
+    - 成功返回已修改项目与转为待复核的互认编号；已认进度随即按新
+      学分计算，之后的申请、改派与复核一律按新标准判断。
+
+    与其它写操作共用 write_tx 进程锁，修订与申请/更正/复核/撤销/改派
+    严格串行；同一进度查询不会读到修订前后混合的标准与互认状态。
+    """
+    if not body.requirement_changes and not body.substitution_changes:
+        raise HTTPException(
+            422,
+            "nothing to revise: provide requirement_changes and/or "
+            "substitution_changes",
+        )
+
+    errors: List[str] = []
+    seen_requirements, seen_rules = set(), set()
+    for i, change in enumerate(body.requirement_changes):
+        if change.requirement_id in seen_requirements:
+            errors.append(
+                f"requirement_changes[{i}]: requirement "
+                f"{change.requirement_id!r} duplicated in batch"
+            )
+        seen_requirements.add(change.requirement_id)
+    for i, change in enumerate(body.substitution_changes):
+        key = (change.course_id, change.requirement_id)
+        if key in seen_rules:
+            errors.append(
+                f"substitution_changes[{i}]: substitution "
+                f"({change.course_id!r}, {change.requirement_id!r}) "
+                "duplicated in batch"
+            )
+        seen_rules.add(key)
+    if errors:
+        raise HTTPException(409, errors)
+
+    with db.write_tx() as conn:
+        for i, change in enumerate(body.requirement_changes):
+            if conn.execute(
+                "SELECT 1 FROM requirements WHERE id = ?",
+                (change.requirement_id,),
+            ).fetchone() is None:
+                errors.append(
+                    f"requirement_changes[{i}]: requirement "
+                    f"{change.requirement_id!r} not found"
+                )
+        for i, change in enumerate(body.substitution_changes):
+            if conn.execute(
+                "SELECT 1 FROM substitutions WHERE course_id = ? AND requirement_id = ?",
+                (change.course_id, change.requirement_id),
+            ).fetchone() is None:
+                errors.append(
+                    f"substitution_changes[{i}]: no substitution rule for "
+                    f"({change.course_id!r}, {change.requirement_id!r})"
+                )
+        if errors:
+            # 抛出异常 -> write_tx 回滚，整次修订不生效
+            raise HTTPException(409, errors)
+
+        for change in body.requirement_changes:
+            conn.execute(
+                "UPDATE requirements SET required_credits = ? WHERE id = ?",
+                (change.required_credits, change.requirement_id),
+            )
+        for change in body.substitution_changes:
+            conn.execute(
+                "UPDATE substitutions SET min_score = ? "
+                "WHERE course_id = ? AND requirement_id = ?",
+                (change.min_score, change.course_id, change.requirement_id),
+            )
+
+        # 新标准共同生效后重检现存"已认"互认；"待复核"记录不在此列，
+        # 即使重新达标也保持待复核，等待显式复核。
+        moved: List[int] = []
+        recs = conn.execute(
+            "SELECT id, course_id, requirement_id FROM recognitions "
+            "WHERE status = 'confirmed' ORDER BY id"
+        ).fetchall()
+        for rec in recs:
+            if not _qualifies(conn, rec["course_id"], rec["requirement_id"]):
+                conn.execute(
+                    "UPDATE recognitions SET status = 'pending', "
+                    "updated_at = datetime('now') WHERE id = ?",
+                    (rec["id"],),
+                )
+                moved.append(rec["id"])
+
+    return {
+        "revised": {
+            "requirements": [c.model_dump() for c in body.requirement_changes],
+            "substitutions": [c.model_dump() for c in body.substitution_changes],
+        },
+        "moved_to_pending": moved,
     }
 
 

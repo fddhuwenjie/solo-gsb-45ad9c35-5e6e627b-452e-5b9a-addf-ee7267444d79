@@ -597,6 +597,345 @@ def test_concurrent_reassign_serialized(client):
     assert progress["remaining_credits"] == 4  # RC 等总需 12
 
 
+# ------------------------------------------------------------ 培养方案修订
+
+
+def revision_seed(client):
+    seed(
+        client,
+        courses=[("P1", 4, 90), ("P2", 4, 65), ("P3", 2, 95)],
+        requirements=[("RP1", 4), ("RP2", 4)],
+        rules=[("P1", "RP1", 60), ("P2", "RP2", 60), ("P3", "RP1", 60)],
+    )
+
+
+def test_plan_revision_rechecks_confirmed_records(client):
+    revision_seed(client)
+    client.post(
+        "/recognitions",
+        json={"items": [
+            {"course_id": "P1", "requirement_id": "RP1"},
+            {"course_id": "P2", "requirement_id": "RP2"},
+        ]},
+    )
+    assert client.get("/progress").json()["earned_credits"] == 8
+
+    # RP1 所需学分 4 -> 5（P1 学分 4 不再足额）；
+    # P2/RP2 最低成绩 60 -> 70（P2 成绩 65 不再达标）
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "requirement_changes": [
+                {"requirement_id": "RP1", "required_credits": 5}
+            ],
+            "substitution_changes": [
+                {"course_id": "P2", "requirement_id": "RP2", "min_score": 70}
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "revised": {
+            "requirements": [{"requirement_id": "RP1", "required_credits": 5}],
+            "substitutions": [
+                {"course_id": "P2", "requirement_id": "RP2", "min_score": 70.0}
+            ],
+        },
+        "moved_to_pending": [1, 2],
+    }
+
+    progress = client.get("/progress").json()
+    by_req = {r["requirement_id"]: r for r in progress["requirements"]}
+    assert by_req["RP1"]["status"] == "pending"
+    assert by_req["RP2"]["status"] == "pending"
+    assert progress["total_required_credits"] == 9  # 已认进度按新学分计算
+    assert progress["earned_credits"] == 0
+    assert client.get("/requirements").json()[0]["required_credits"] == 5
+    assert client.get("/substitutions").json()[1]["min_score"] == 70
+
+
+def test_plan_revision_still_qualified_recounts_with_new_credits(client):
+    revision_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "P1", "requirement_id": "RP1"}]}
+    )
+    # 放宽要求学分：4 -> 3，P1 仍合格；已认进度按新学分计 3
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "requirement_changes": [{"requirement_id": "RP1", "required_credits": 3}]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["moved_to_pending"] == []
+    progress = client.get("/progress").json()
+    assert progress["total_required_credits"] == 7
+    assert progress["earned_credits"] == 3
+    assert client.get("/recognitions").json()[0]["status"] == "confirmed"
+
+    # 再调高规则最低成绩但仍低于 P1 的 90 -> 仍合格
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "substitution_changes": [
+                {"course_id": "P1", "requirement_id": "RP1", "min_score": 85}
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["moved_to_pending"] == []
+    assert client.get("/progress").json()["earned_credits"] == 3
+
+
+def test_plan_revision_keeps_both_end_occupations(client):
+    revision_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "P1", "requirement_id": "RP1"}]}
+    )
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "requirement_changes": [{"requirement_id": "RP1", "required_credits": 5}]
+        },
+    )
+    assert resp.json()["moved_to_pending"] == [1]
+
+    # 停止计分但继续占用两端：其它课程无法抢要求，该课程无法申请它处
+    resp = client.post(
+        "/recognitions", json={"items": [{"course_id": "P3", "requirement_id": "RP1"}]}
+    )
+    assert resp.status_code == 409
+    resp = client.post(
+        "/recognitions", json={"items": [{"course_id": "P1", "requirement_id": "RP2"}]}
+    )
+    assert resp.status_code == 409
+
+
+def test_plan_revision_pending_requires_explicit_review(client):
+    revision_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "P2", "requirement_id": "RP2"}]}
+    )
+    # 提高门槛令 P2 失去资格 -> 待复核
+    client.post(
+        "/plan-revisions",
+        json={
+            "substitution_changes": [
+                {"course_id": "P2", "requirement_id": "RP2", "min_score": 80}
+            ]
+        },
+    )
+    assert client.get("/progress").json()["earned_credits"] == 0
+
+    # 重新放宽到达标：原本待复核的记录不自动计分，须显式复核
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "substitution_changes": [
+                {"course_id": "P2", "requirement_id": "RP2", "min_score": 60}
+            ]
+        },
+    )
+    assert resp.json()["moved_to_pending"] == []
+    assert client.get("/progress").json()["earned_credits"] == 0
+    assert (
+        client.get("/recognitions", params={"status": "pending"}).json()[0]["id"] == 1
+    )
+    resp = client.post("/recognitions/1/review")
+    assert resp.json() == {"id": 1, "qualified": True, "status": "confirmed"}
+    assert client.get("/progress").json()["earned_credits"] == 4
+
+
+def test_plan_revision_all_or_nothing_missing_reference(client):
+    revision_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "P1", "requirement_id": "RP1"}]}
+    )
+    # 一项合法、一项引用不存在的规则 -> 整次不生效
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "requirement_changes": [{"requirement_id": "RP1", "required_credits": 3}],
+            "substitution_changes": [
+                {"course_id": "P1", "requirement_id": "NOPE", "min_score": 50}
+            ],
+        },
+    )
+    assert resp.status_code == 409
+    assert "no substitution rule" in resp.json()["detail"][0]
+
+    # 要求学分未改、互认未转待复核、进度不变
+    reqs = {r["id"]: r for r in client.get("/requirements").json()}
+    assert reqs["RP1"]["required_credits"] == 4
+    assert client.get("/recognitions").json()[0]["status"] == "confirmed"
+    assert client.get("/progress").json()["earned_credits"] == 4
+
+    # 引用不存在的要求同样整次拒绝
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "requirement_changes": [
+                {"requirement_id": "NOPE", "required_credits": 3}
+            ]
+        },
+    )
+    assert resp.status_code == 409
+    assert "not found" in resp.json()["detail"][0]
+
+
+def test_plan_revision_rejects_duplicates_and_empty(client):
+    revision_seed(client)
+    # 同一要求重复
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "requirement_changes": [
+                {"requirement_id": "RP1", "required_credits": 3},
+                {"requirement_id": "RP1", "required_credits": 5},
+            ]
+        },
+    )
+    assert resp.status_code == 409
+    assert "duplicated in batch" in resp.json()["detail"][0]
+    # 同一替代规则重复
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "substitution_changes": [
+                {"course_id": "P1", "requirement_id": "RP1", "min_score": 50},
+                {"course_id": "P1", "requirement_id": "RP1", "min_score": 80},
+            ]
+        },
+    )
+    assert resp.status_code == 409
+    assert "duplicated in batch" in resp.json()["detail"][0]
+    # 两项均缺省 -> 没有任何改动
+    assert client.post("/plan-revisions", json={}).status_code == 422
+    # 数值无效 -> 422
+    assert client.post(
+        "/plan-revisions",
+        json={"requirement_changes": [{"requirement_id": "RP1", "required_credits": 0}]},
+    ).status_code == 422
+    assert client.post(
+        "/plan-revisions",
+        json={
+            "substitution_changes": [
+                {"course_id": "P1", "requirement_id": "RP1", "min_score": 101}
+            ]
+        },
+    ).status_code == 422
+    # 被拒后数据原样
+    reqs = {r["id"]: r for r in client.get("/requirements").json()}
+    assert reqs["RP1"]["required_credits"] == 4
+    rules = client.get("/substitutions").json()
+    assert all(r["min_score"] == 60 for r in rules)
+
+
+def test_plan_revision_new_standard_governs_apply_and_reassign(client):
+    seed(
+        client,
+        courses=[("Q1", 6, 90), ("Q2", 4, 80)],
+        requirements=[("RQ1", 4), ("RQ2", 4)],
+        rules=[("Q1", "RQ1", 60), ("Q1", "RQ2", 60), ("Q2", "RQ2", 60)],
+    )
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "Q1", "requirement_id": "RQ1"}]}
+    )
+    # 新标准：RQ1 需要 5 学分、Q1/RQ1 最低成绩 95 -> 互认 1 转待复核
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "requirement_changes": [{"requirement_id": "RQ1", "required_credits": 5}],
+            "substitution_changes": [
+                {"course_id": "Q1", "requirement_id": "RQ1", "min_score": 95}
+            ],
+        },
+    )
+    assert resp.json()["moved_to_pending"] == [1]
+
+    # 后续申请按新标准判断：Q2 学分 4 < 5，无法认 RQ1（且 RQ1 仍被占用）
+    assert client.post(
+        "/recognitions", json={"items": [{"course_id": "Q2", "requirement_id": "RQ1"}]}
+    ).status_code == 409
+
+    # Q1 改派 RQ2：待复核来源不可改派；显式复核也无法恢复
+    # （Q1 成绩 90 < 95 且 RQ1 现需 5 学分，Q1 学分 6 已足额）
+    assert client.post("/recognitions/1/review").json()["qualified"] is False
+
+    # 放宽 RQ1 规则成绩后显式复核恢复，再改派到 RQ2 按新标准核对
+    # （RQ2 学分仍为 4、Q1/RQ2 最低 60，合格）
+    client.post(
+        "/plan-revisions",
+        json={
+            "substitution_changes": [
+                {"course_id": "Q1", "requirement_id": "RQ1", "min_score": 90}
+            ]
+        },
+    )
+    assert client.post("/recognitions/1/review").json()["status"] == "confirmed"
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "target_requirement_id": "RQ2"}]},
+    )
+    assert resp.status_code == 200
+
+    # 改派后再提高 RQ2 门槛令 Q1 不合格 -> 按新标准转待复核
+    resp = client.post(
+        "/plan-revisions",
+        json={
+            "substitution_changes": [
+                {"course_id": "Q1", "requirement_id": "RQ2", "min_score": 95}
+            ]
+        },
+    )
+    assert resp.json()["moved_to_pending"] == [1]
+    by_req = {
+        r["requirement_id"]: r
+        for r in client.get("/progress").json()["requirements"]
+    }
+    assert by_req["RQ2"]["status"] == "pending"
+
+
+def test_concurrent_plan_revision_serialized(client):
+    revision_seed(client)
+    client.post(
+        "/recognitions",
+        json={"items": [
+            {"course_id": "P1", "requirement_id": "RP1"},
+            {"course_id": "P2", "requirement_id": "RP2"},
+        ]},
+    )
+
+    def write(i):
+        with TestClient(app) as c:
+            if i % 2:
+                # 反复横跳 P1/RP1 最低成绩：95（不合格）与 60（合格）
+                return c.post(
+                    "/plan-revisions",
+                    json={
+                        "substitution_changes": [
+                            {
+                                "course_id": "P1",
+                                "requirement_id": "RP1",
+                                "min_score": 95 if i % 4 == 1 else 60,
+                            }
+                        ]
+                    },
+                ).status_code
+            return c.put("/courses/P2", json={"score": 50 if i % 4 == 2 else 90}).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        codes = list(ex.map(write, range(20)))
+
+    # 串行化后每个写操作自洽：状态只能是 confirmed/pending，占用始终唯一
+    assert all(code == 200 for code in codes)
+    recs = client.get("/recognitions").json()
+    assert len(recs) == 2
+    assert {r["status"] for r in recs} <= {"confirmed", "pending"}
+    reqs_occupied = [r["requirement_id"] for r in recs]
+    assert len(set(reqs_occupied)) == 2
+
+
 # ------------------------------------------------------------ 并发
 
 
